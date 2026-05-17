@@ -1,0 +1,127 @@
+clc;clear;
+
+addpath ./function
+%% Signal parameters
+PtxdBm = 1; 
+fiblen = 2e3; 
+bitRate = 200*1e9;   
+M = 4;            
+nSymb = 2^15;     
+sim.Rb = bitRate;    
+sim.Nsymb = nSymb; 
+sim.ros.txDSP = 2; 
+sim.ros.rxDSP = 1; 
+sim.Mct = 2*5;      
+sim.Ndiscard = 512; 
+sim.N = sim.Mct*sim.Nsymb; 
+sim.Modulator = 'MZM'; 
+
+%% Simulation control
+sim.preemphRange = 25e9; 
+sim.RIN = true; 
+sim.phase_noise = true; 
+sim.PMD = true; 
+sim.quantiz = true; 
+
+%% Pulse shape 
+Tx.pulse_shape = select_pulse_shape('rrc', sim.ros.txDSP, 0.15, 6);
+
+%% M-PAM
+mpam = PAM(4, sim.Rb, 'equally-spaced', Tx.pulse_shape);
+
+%% Time and frequency
+sim.fs = mpam.Rs*sim.Mct;  
+[sim.f, sim.t] = freq_time(sim.N, sim.fs);
+
+%% ========================== Transmitter ================================
+%% DAC
+Tx.DAC.fs = sim.ros.txDSP*mpam.Rs; 
+Tx.DAC.ros = sim.ros.txDSP; 
+Tx.DAC.resolution = 8; 
+Tx.DAC.filt = design_filter('bessel', 5, 0.7*mpam.Rs/(sim.fs/2)); 
+
+%% Laser
+Tx.Laser = laser(1550e-9, 0, -150, 0.1e6, 0);
+
+%% Modulator
+Tx.Mod.type = sim.Modulator; 
+Tx.Vgain = 1; 
+Tx.VbiasAdj = 1; 
+Tx.Mod.Vbias = 0.5; 
+Tx.Mod.Vswing = 1;  
+Tx.Mod.BW = 40e9; 
+Tx.Mod.filt = design_filter('butter', 5, 0.7*mpam.Rs/(sim.fs/2)); 
+Tx.Mod.H = Tx.Mod.filt.H(sim.f/sim.fs);
+Tx.PtxdBm = PtxdBm;
+Tx.Ptx = dBm2Watt(Tx.PtxdBm); 
+
+%% ========================== Fiber ========================== 
+SMF = fiber(fiblen, @(lamb) 0.2);
+Fibers = SMF;
+
+%% ========================== Receiver ========================== 
+%% Photodiodes
+Rx.PD = pin(1, 10e-9, 70e9);
+
+%% TIA-AGC
+Rx.N0 = (30e-12).^2; 
+
+%% Receiver DSP
+Rx.filtering = 'antialiasing'; 
+
+%% ADC for direct detection case
+Rx.ADC.fs = mpam.Rs*sim.ros.rxDSP;
+Rx.ADC.ros = sim.ros.rxDSP;
+Rx.ADC.filt = design_filter('butter', 5, (Rx.ADC.fs/2)/(sim.fs/2)); 
+Rx.ADC.ENOB = 8; 
+Rx.ADC.rclip = 0;
+
+%% Run Sim to get optical signal
+[Erx, xt, dataTX] = getsignal (sim,Tx,mpam,Fibers);
+
+%% ONN
+[Cn, n_99] = get_fourier_coefficients(fiblen);
+preTap = n_99;
+posTap = n_99;
+outTap = 1;
+inputSize = preTap+posTap+outTap;
+ss = sim.Mct;
+Erx_input_ONN = zeros(inputSize,ss*(nSymb-inputSize+1));
+
+for tap = 1:inputSize
+    Erx_input_ONN(tap,:) = sqrt(1/inputSize) * Erx(1+(tap-1)*ss:outTap:end-inputSize*ss+tap*ss);
+end
+
+N = length(Cn);
+idx_center = ceil(N/2);
+idx = idx_center-preTap : idx_center+posTap;
+Cn_99 = Cn(idx);
+
+Erx_ONN_output = Cn_99.'* Erx_input_ONN;
+
+%% PD
+[PrxdBm, Prx] = power_meter(Erx_ONN_output);
+yt = Rx.PD.detect(Erx_ONN_output, sim.fs, 'gaussian', Rx.N0);
+fprintf('> Received power: %.2f dBm\n', PrxdBm);
+
+% Normalize
+yt = yt - mean(yt);
+yt = yt*sqrt(mean(abs(mpam.a).^2)/(sqrt(2)*mean(abs(yt).^2)));
+
+%% ADC
+Hrx = Rx.ADC.filt.H(sim.f/sim.fs);
+Rx.ADC.timeRefSignal = xt; 
+[yk, ~, ytf] = adc(yt, Rx.ADC, sim);
+
+%% =========================== Equalization ===============================
+ntaps = 7; 
+refTap = 2; 
+forgetFactor = 0.999999;
+[weights, yd] = FFE_RLS(yk', dataTX', ntaps, refTap, forgetFactor);
+ndiscard = [1:sim.Ndiscard (length(yd)-sim.Ndiscard+1):length(yd)];
+yd(ndiscard) = []; 
+dataTX(ndiscard) = []; 
+dataRX = pam4demod(yd)';
+[dataTXX,dataRXX] = align_signals_by_max_cross_correlation(dataTX, dataRX);
+[~, ber_count2] = biterr(dataRXX, dataTXX);
+fprintf(['ONN(Fourier)-FFE  BER = ', num2str(ber_count2),'\n']);
